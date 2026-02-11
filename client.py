@@ -4,27 +4,52 @@ import os
 import time
 import protocol
 
-SERVER_IP = '127.0.0.1'
-PORT = 12345
+# Default configuration
+DEFAULT_IP = '127.0.0.1'
+DEFAULT_PORT = 12345
 DOWNLOAD_DIR = "client_downloads"
 
 def main():
     """
-    Main client entry point. Connects to server and enters input loop.
+    Main client entry point.
+    Parses command line arguments for IP and Port.
+    Usage: python client.py [Server_IP] [Port]
     """
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
 
+    # Parse Command Line Arguments
+    serverIp = DEFAULT_IP
+    serverPort = DEFAULT_PORT
+
+    if len(sys.argv) >= 2:
+        serverIp = sys.argv[1]
+
+    if len(sys.argv) >= 3:
+        try:
+            serverPort = int(sys.argv[2])
+        except ValueError:
+            print("Invalid port number provided. Using default.")
+
+    print(f"Attempting to connect to {serverIp}:{serverPort}...")
+
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((SERVER_IP, PORT))
+        sock.connect((serverIp, serverPort))
         protocol.configureKeepAlive(sock)
-        print(f"Connected to {SERVER_IP}:{PORT}")
+
+        print(f"Successfully connected to {serverIp}:{serverPort}")
+        print("Available commands: ECHO <msg>, TIME, CLOSE, UPLOAD <file>, DOWNLOAD <file>")
 
         connBuffer = protocol.ConnectionBuffer()
 
         while True:
-            userIn = input("client> ").strip()
+            try:
+                userIn = input("client> ").strip()
+            except EOFError:
+                # Handle Ctrl+D (Linux) or Ctrl+Z (Windows) gracefully
+                break
+
             if not userIn:
                 continue
 
@@ -35,11 +60,16 @@ def main():
             processInput(sock, userIn, connBuffer)
 
     except ConnectionRefusedError:
-        print("Could not connect to server.")
+        print(f"Connection refused. Ensure server is running at {serverIp}:{serverPort} and Firewall is open.")
+    except socket.gaierror:
+        print("Invalid IP address format.")
+    except socket.timeout:
+        print("Connection timed out.")
     except Exception as e:
         print(f"Error: {e}")
     finally:
         sock.close()
+        print("Client closed.")
 
 def processInput(sock, userIn, connBuffer):
     """
@@ -82,7 +112,8 @@ def performUpload(sock, parts, connBuffer):
         return
 
     offset = int(response.split(' ')[1])
-    print(f"Resuming upload from byte {offset}...")
+    if offset > 0:
+        print(f"Resuming upload from byte {offset}...")
 
     startTime = time.time()
 
