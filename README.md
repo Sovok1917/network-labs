@@ -1,7 +1,3 @@
-Here is a concise, developer-focused version. It covers the essentials without the extra fluff.
-
-***
-
 # net-labs
 
 Implementations for a Network Programming course focusing on socket-level communication and distributed systems.
