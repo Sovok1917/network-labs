@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Lab specific storage
+lab1/server_files/
+lab1/client_downloads/
+
+# IDEs
+.vscode/
+.idea/
