@@ -200,3 +200,6 @@ def calculateBitrate(bytesTransferred, start, end):
     bits = bytesTransferred * 8
     mbps = (bits / 1_000_000) / duration
     print(f"Speed: {mbps:.2f} Mbps")
+
+if __name__ == "__main__":
+    main()
