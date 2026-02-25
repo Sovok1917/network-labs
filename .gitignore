@@ -8,8 +8,9 @@ __pycache__/
 Thumbs.db
 
 # Lab specific storage
-lab1/server_files/
-lab1/client_downloads/
+server_files/
+client_downloads/
+*img
 
 # IDEs
 .vscode/
