@@ -4,21 +4,31 @@ import os
 import time
 import protocol
 
-# Default configuration
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 12345
 DOWNLOAD_DIR = "client_downloads"
+
+def printHelp():
+    """
+    Prints a formatted list of all available commands and their usage.
+    """
+    print("\n--- Available Commands ---")
+    print("  HELP                - Show this help message")
+    print("  ECHO <message>      - Ask the server to echo the message back")
+    print("  TIME                - Get the current time from the server")
+    print("  UPLOAD <filename>   - Upload a local file to the server (supports resume)")
+    print("  DOWNLOAD <filename> - Download a file from the server (supports resume)")
+    print("  CLOSE               - Close the connection and exit")
+    print("--------------------------\n")
 
 def main():
     """
     Main client entry point.
     Parses command line arguments for IP and Port.
-    Usage: python client.py [Server_IP] [Port]
     """
     if not os.path.exists(DOWNLOAD_DIR):
         os.makedirs(DOWNLOAD_DIR)
 
-    # Parse Command Line Arguments
     serverIp = DEFAULT_IP
     serverPort = DEFAULT_PORT
 
@@ -39,7 +49,7 @@ def main():
         protocol.configureKeepAlive(sock)
 
         print(f"Successfully connected to {serverIp}:{serverPort}")
-        print("Available commands: ECHO <msg>, TIME, CLOSE, UPLOAD <file>, DOWNLOAD <file>")
+        printHelp()
 
         connBuffer = protocol.ConnectionBuffer()
 
@@ -47,7 +57,6 @@ def main():
             try:
                 userIn = input("client> ").strip()
             except EOFError:
-                # Handle Ctrl+D (Linux) or Ctrl+Z (Windows) gracefully
                 break
 
             if not userIn:
@@ -79,12 +88,13 @@ def processInput(sock, userIn, connBuffer):
     parts = userIn.split(' ')
     cmd = parts[0].upper()
 
-    if cmd == 'UPLOAD':
+    if cmd == 'HELP':
+        printHelp()
+    elif cmd == 'UPLOAD':
         performUpload(sock, parts, connBuffer)
     elif cmd == 'DOWNLOAD':
         performDownload(sock, parts, connBuffer)
     else:
-        # Standard text command
         protocol.sendMessage(sock, userIn)
         response = protocol.receiveLine(sock, connBuffer)
         print(f"Server: {response}")
@@ -105,7 +115,6 @@ def performUpload(sock, parts, connBuffer):
     fileSize = os.path.getsize(filename)
     protocol.sendMessage(sock, f"UPLOAD {os.path.basename(filename)} {fileSize}")
 
-    # Wait for server to tell us where to resume from
     response = protocol.receiveLine(sock, connBuffer)
     if not response.startswith("OFFSET"):
         print(f"Server Error: {response}")
@@ -127,7 +136,6 @@ def performUpload(sock, parts, connBuffer):
             protocol.sendRawData(sock, chunk)
             sentBytes += len(chunk)
 
-    # Wait for final confirmation
     finalMsg = protocol.receiveLine(sock, connBuffer)
     endTime = time.time()
 
@@ -147,7 +155,6 @@ def performDownload(sock, parts, connBuffer):
 
     protocol.sendMessage(sock, f"DOWNLOAD {filename}")
 
-    # Get file size from server
     response = protocol.receiveLine(sock, connBuffer)
     if response.startswith("ERROR"):
         print(f"Server: {response}")
@@ -155,7 +162,6 @@ def performDownload(sock, parts, connBuffer):
 
     totalSize = int(response.split(' ')[1])
 
-    # Check local partial file for resume
     currentSize = 0
     if os.path.exists(localPath):
         currentSize = os.path.getsize(localPath)
@@ -189,11 +195,8 @@ def calculateBitrate(bytesTransferred, start, end):
     """
     duration = end - start
     if duration <= 0:
-        duration = 0.001 # Avoid division by zero
+        duration = 0.001
 
     bits = bytesTransferred * 8
     mbps = (bits / 1_000_000) / duration
     print(f"Speed: {mbps:.2f} Mbps")
-
-if __name__ == "__main__":
-    main()
