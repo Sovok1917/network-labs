@@ -75,7 +75,7 @@ def handleDownload(sock, args, connBuffer):
     Protocol:
     1. Server checks file -> Sends SIZE <bytes> or ERROR
     2. Client sends OFFSET <bytes>
-    3. Server sends raw bytes
+    3. Server sends raw bytes in chunks to prevent memory leaks
     """
     if len(args) < 2:
         protocol.sendMessage(sock, "ERROR: Missing filename")
@@ -91,7 +91,6 @@ def handleDownload(sock, args, connBuffer):
     filesize = os.path.getsize(filepath)
     protocol.sendMessage(sock, f"SIZE {filesize}")
 
-    # Wait for client to say where to start (Resume logic)
     try:
         response = protocol.receiveLine(sock, connBuffer)
         if not response.startswith("OFFSET"):
@@ -101,11 +100,16 @@ def handleDownload(sock, args, connBuffer):
 
         with open(filepath, 'rb') as f:
             f.seek(offset)
-            data = f.read()
-            protocol.sendRawData(sock, data)
+            while True:
+                chunk = f.read(4096)
+                if not chunk:
+                    break
+                protocol.sendRawData(sock, chunk)
 
     except ValueError:
         print("Invalid offset received")
+    except Exception as e:
+        print(f"Error during file read/send: {e}")
 
 def handleUpload(sock, args, connBuffer):
     """
