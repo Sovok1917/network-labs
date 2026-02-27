@@ -7,11 +7,10 @@ import protocol
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 12345
 DOWNLOAD_DIR = "client_downloads"
-CHUNK_SIZE = 1024 * 1024 # 1MB chunks
 
 def printHelp():
     print("\n--- Available Commands ---")
-    print("  HELP, ECHO <msg>, TIME, CLOSE, UPLOAD <file>, DOWNLOAD <file>")
+    print("  HELP, LIST, ECHO <msg>, TIME, UPLOAD <file>, DOWNLOAD <file>, CLOSE")
     print("--------------------------\n")
 
 def main():
@@ -29,6 +28,7 @@ def main():
     try:
         if isUdp:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            protocol.configureUdpBuffer(sock)
             transport = protocol.UdpTransport(sock, (serverIp, serverPort))
         else:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -80,7 +80,7 @@ def performUpload(transport, parts):
     with open(filename, 'rb') as f:
         f.seek(offset)
         while True:
-            chunk = f.read(CHUNK_SIZE)
+            chunk = f.read(protocol.CHUNK_SIZE)
             if not chunk: break
             transport.sendRawData(chunk)
             sentBytes += len(chunk)
@@ -109,8 +109,8 @@ def performDownload(transport, parts):
 
     with open(localPath, 'ab') as f:
         while remaining > 0:
-            chunkSize = min(CHUNK_SIZE, remaining)
-            data = transport.receiveRawData(chunkSize)
+            cSize = min(protocol.CHUNK_SIZE, remaining)
+            data = transport.receiveRawData(cSize)
             f.write(data)
             remaining -= len(data)
             receivedBytes += len(data)
