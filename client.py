@@ -7,6 +7,7 @@ import protocol
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 12345
 DOWNLOAD_DIR = "client_downloads"
+DISK_CHUNK = 65536 # 64KB chunks for real-time disk flushing
 
 def printHelp():
     print("\n--- Available Commands ---")
@@ -80,7 +81,7 @@ def performUpload(transport, parts):
     with open(filename, 'rb') as f:
         f.seek(offset)
         while True:
-            chunk = f.read(protocol.CHUNK_SIZE)
+            chunk = f.read(DISK_CHUNK)
             if not chunk: break
             transport.sendRawData(chunk)
             sentBytes += len(chunk)
@@ -109,9 +110,10 @@ def performDownload(transport, parts):
 
     with open(localPath, 'ab') as f:
         while remaining > 0:
-            cSize = min(protocol.CHUNK_SIZE, remaining)
+            cSize = min(DISK_CHUNK, remaining)
             data = transport.receiveRawData(cSize)
             f.write(data)
+            f.flush() # CRITICAL: Force Python to write to the hard drive instantly
             remaining -= len(data)
             receivedBytes += len(data)
 
