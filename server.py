@@ -2,23 +2,13 @@ import socket
 import os
 import datetime
 import select
+import threading
 import protocol
 
 HOST = '0.0.0.0'
 PORT = 12345
 STORAGE_DIR = "server_files"
-CHUNK_SIZE = 65536 # 64KB chunk ensures instant multiplexing response
-
-class ClientState:
-    """Tracks the state machine for a single asynchronous TCP connection."""
-    def __init__(self, sock):
-        self.sock = sock
-        self.state = 'IDLE'
-        self.buffer = b""
-        self.send_buffer = b""
-        self.file = None
-        self.remaining = 0
-        self.filename = ""
+DISK_CHUNK = 65536
 
 def main():
     if not os.path.exists(STORAGE_DIR):
@@ -28,182 +18,133 @@ def main():
     tcpSock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcpSock.bind((HOST, PORT))
     tcpSock.listen(5)
-    tcpSock.setblocking(False)
 
     udpSock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udpSock.bind((HOST, PORT))
     protocol.configureUdpBuffer(udpSock)
 
-    inputs = [tcpSock, udpSock]
-    outputs =[]
-    clients = {}
+    print(f"Threaded Server (Variant 2) listening on {HOST}:{PORT}")
 
-    print(f"Multiplexed Server listening on {HOST}:{PORT}")
-
+    # Main Thread: Responsible ONLY for accepting connections
     while True:
         try:
-            r, w, e = select.select(inputs, outputs, inputs)
+            # We use select to monitor both TCP (for new connections) and UDP
+            inputs = [tcpSock, udpSock]
+            r, _, _ = select.select(inputs, [], [])
 
             for sock in r:
                 if sock == tcpSock:
-                    acceptClient(sock, inputs, clients)
+                    # New TCP Client -> Spawn a Thread
+                    clientSock, addr = tcpSock.accept()
+                    print(f"Main Thread: Accepted connection from {addr}")
+                    t = threading.Thread(target=handleTcpClient, args=(clientSock, addr))
+                    t.daemon = True # Ensures threads close if server exits
+                    t.start()
+
                 elif sock == udpSock:
-                    handleUdpSession(protocol.UdpTransport(udpSock))
-                else:
-                    handleRead(sock, inputs, outputs, clients)
-
-            for sock in w:
-                if sock in clients:
-                    handleWrite(sock, outputs, clients)
-
-            for sock in e:
-                if sock in clients:
-                    disconnectClient(sock, inputs, outputs, clients)
+                    # UDP Packet -> Handle in Main Thread (or spawn thread if preferred)
+                    # Keeping it simple: UDP is stateless/fast, handle here.
+                    transport = protocol.UdpTransport(udpSock)
+                    handleSession(transport, True)
 
         except KeyboardInterrupt: break
-        except Exception as ex: print(f"Server loop error: {ex}")
+        except Exception as ex: print(f"Main Loop Error: {ex}")
 
     tcpSock.close()
     udpSock.close()
 
-def acceptClient(serverSock, inputs, clients):
-    clientSock, addr = serverSock.accept()
-    clientSock.setblocking(False)
-    protocol.configureKeepAlive(clientSock)
-    inputs.append(clientSock)
-    clients[clientSock] = ClientState(clientSock)
-    print(f"TCP Connected: {addr}")
-
-def disconnectClient(sock, inputs, outputs, clients):
-    if sock in inputs: inputs.remove(sock)
-    if sock in outputs: outputs.remove(sock)
-    if sock in clients:
-        if clients[sock].file: clients[sock].file.close()
-        del clients[sock]
-    sock.close()
-    print("Client disconnected.")
-
-def handleRead(sock, inputs, outputs, clients):
-    client = clients[sock]
+def handleTcpClient(sock, addr):
+    """
+    Dedicated Thread entry point for a TCP client.
+    Uses Blocking I/O for simple linear execution.
+    """
+    print(f"Thread-{threading.get_ident()}: Started handler for {addr}")
     try:
-        data = sock.recv(CHUNK_SIZE)
-        if not data:
-            disconnectClient(sock, inputs, outputs, clients)
-            return
-    except (BlockingIOError, ConnectionResetError): return
+        # Revert to blocking mode for Threading simplicity
+        sock.setblocking(True)
+        transport = protocol.TcpTransport(sock)
+        handleSession(transport, False)
+    except Exception as e:
+        print(f"Thread-{threading.get_ident()} Error: {e}")
+    finally:
+        sock.close()
+        print(f"Thread-{threading.get_ident()}: Closed connection {addr}")
 
-    if client.state == 'IDLE':
-        client.buffer += data
-        while b'\n' in client.buffer:
-            line, client.buffer = client.buffer.split(b'\n', 1)
-            processCmd(client, line.decode('utf-8').strip(), outputs)
-
-    elif client.state == 'RECV_UPLOAD':
-        client.file.write(data)
-        client.file.flush() # CRITICAL: Pushes the uploaded chunk to disk instantly
-        client.remaining -= len(data)
-        if client.remaining <= 0:
-            client.file.close()
-            client.file = None
-            client.send_buffer += b"UPLOAD COMPLETE\n"
-            if sock not in outputs: outputs.append(sock)
-            client.state = 'IDLE'
-
-def handleWrite(sock, outputs, clients):
-    client = clients[sock]
+def handleSession(transport, isUdp):
+    """
+    Shared session logic (Blocking style).
+    Used by both TCP Threads and UDP Main Loop.
+    """
     try:
-        if client.send_buffer:
-            sent = sock.send(client.send_buffer)
-            client.send_buffer = client.send_buffer[sent:]
+        while True:
+            commandLine = transport.receiveLine()
+            if not commandLine: break
 
-        elif client.state == 'SEND_DOWNLOAD':
-            chunk = client.file.read(CHUNK_SIZE)
-            if chunk:
-                sent = sock.send(chunk)
-                if sent < len(chunk):
-                    client.file.seek(-(len(chunk) - sent), os.SEEK_CUR)
+            parts = commandLine.split(' ')
+            cmd = parts[0].upper()
+
+            if cmd == 'ECHO':
+                transport.sendMessage(" ".join(parts[1:]))
+            elif cmd == 'TIME':
+                transport.sendMessage(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            elif cmd == 'LIST':
+                files = ", ".join(os.listdir(STORAGE_DIR)) or "No files"
+                transport.sendMessage(files)
+            elif cmd == 'CLOSE':
+                transport.sendMessage("BYE")
+                break
+            elif cmd == 'DOWNLOAD':
+                handleDownload(transport, parts)
+            elif cmd == 'UPLOAD':
+                handleUpload(transport, parts)
             else:
-                client.file.close()
-                client.file = None
-                client.state = 'IDLE'
-                if sock in outputs: outputs.remove(sock)
+                transport.sendMessage("UNKNOWN COMMAND")
 
-        if not client.send_buffer and client.state != 'SEND_DOWNLOAD':
-            if sock in outputs: outputs.remove(sock)
+            if isUdp: break # UDP is one-shot
 
-    except (BlockingIOError, ConnectionResetError): pass
+    except (ConnectionResetError, BrokenPipeError):
+        pass # Normal disconnect
 
-def processCmd(client, line, outputs):
-    parts = line.split(' ')
-    cmd = parts[0].upper()
+def handleDownload(transport, args):
+    if len(args) < 2: return
+    filepath = os.path.join(STORAGE_DIR, os.path.basename(args[1]))
+    if not os.path.exists(filepath):
+        transport.sendMessage("ERROR: File not found")
+        return
 
-    if cmd == 'ECHO':
-        client.send_buffer += (line[5:] + "\n").encode('utf-8')
-    elif cmd == 'TIME':
-        client.send_buffer += (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n").encode('utf-8')
-    elif cmd == 'LIST':
-        files = ", ".join(os.listdir(STORAGE_DIR)) or "No files"
-        client.send_buffer += (files + "\n").encode('utf-8')
-    elif cmd == 'UPLOAD' and len(parts) >= 3:
-        client.filename = os.path.join(STORAGE_DIR, os.path.basename(parts[1]))
-        cur_sz = os.path.getsize(client.filename) if os.path.exists(client.filename) else 0
-        client.remaining = int(parts[2]) - cur_sz
-        client.send_buffer += f"OFFSET {cur_sz}\n".encode('utf-8')
-        client.file = open(client.filename, 'ab')
-        client.state = 'RECV_UPLOAD'
-    elif cmd == 'DOWNLOAD' and len(parts) >= 2:
-        client.filename = os.path.join(STORAGE_DIR, os.path.basename(parts[1]))
-        if os.path.exists(client.filename):
-            client.send_buffer += f"SIZE {os.path.getsize(client.filename)}\n".encode('utf-8')
-        else:
-            client.send_buffer += b"ERROR: File not found\n"
-    elif cmd == 'OFFSET' and len(parts) >= 2:
-        client.file = open(client.filename, 'rb')
-        client.file.seek(int(parts[1]))
-        client.state = 'SEND_DOWNLOAD'
-    elif cmd == 'CLOSE':
-        client.send_buffer += b"BYE\n"
-
-    if client.send_buffer or client.state == 'SEND_DOWNLOAD':
-        if client.sock not in outputs: outputs.append(client.sock)
-
-def handleUdpSession(transport):
+    transport.sendMessage(f"SIZE {os.path.getsize(filepath)}")
     try:
-        commandLine = transport.receiveLine()
-        parts = commandLine.split(' ')
-        cmd = parts[0].upper()
+        response = transport.receiveLine()
+        if not response.startswith("OFFSET"): return
 
-        if cmd == 'ECHO': transport.sendMessage(" ".join(parts[1:]))
-        elif cmd == 'TIME': transport.sendMessage(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        elif cmd == 'LIST': transport.sendMessage(", ".join(os.listdir(STORAGE_DIR)) or "No files")
-        elif cmd == 'DOWNLOAD':
-            filepath = os.path.join(STORAGE_DIR, os.path.basename(parts[1]))
-            if not os.path.exists(filepath):
-                transport.sendMessage("ERROR: File not found")
-                return
-            transport.sendMessage(f"SIZE {os.path.getsize(filepath)}")
-            response = transport.receiveLine()
-            if response.startswith("OFFSET"):
-                with open(filepath, 'rb') as f:
-                    f.seek(int(response.split(' ')[1]))
-                    while True:
-                        chunk = f.read(CHUNK_SIZE)
-                        if not chunk: break
-                        transport.sendRawData(chunk)
-        elif cmd == 'UPLOAD':
-            filepath = os.path.join(STORAGE_DIR, os.path.basename(parts[1]))
-            curSize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-            if curSize >= int(parts[2]): curSize = 0; os.remove(filepath)
-            transport.sendMessage(f"OFFSET {curSize}")
-            rem = int(parts[2]) - curSize
-            with open(filepath, 'ab') as f:
-                while rem > 0:
-                    data = transport.receiveRawData(min(CHUNK_SIZE, rem))
-                    f.write(data)
-                    f.flush()
-                    rem -= len(data)
-            transport.sendMessage("UPLOAD COMPLETE")
-    except Exception as e: print(f"UDP Error: {e}")
+        offset = int(response.split(' ')[1])
+        with open(filepath, 'rb') as f:
+            f.seek(offset)
+            while True:
+                chunk = f.read(DISK_CHUNK)
+                if not chunk: break
+                transport.sendRawData(chunk)
+    except ValueError: pass
+
+def handleUpload(transport, args):
+    if len(args) < 3: return
+    filepath = os.path.join(STORAGE_DIR, os.path.basename(args[1]))
+    totalSize = int(args[2])
+
+    currentSize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    if currentSize >= totalSize: currentSize = 0; os.remove(filepath)
+
+    transport.sendMessage(f"OFFSET {currentSize}")
+    remaining = totalSize - currentSize
+    with open(filepath, 'ab') as f:
+        while remaining > 0:
+            cSize = min(DISK_CHUNK, remaining)
+            data = transport.receiveRawData(cSize)
+            f.write(data)
+            f.flush() # Ensure atomic write visibility
+            remaining -= len(data)
+
+    transport.sendMessage("UPLOAD COMPLETE")
 
 if __name__ == "__main__":
     main()
