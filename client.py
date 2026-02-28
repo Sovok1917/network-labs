@@ -36,11 +36,7 @@ def printInfo(msg):
 
 def printHelp():
     print(f"\n{Colors.HEADER}--- Available Commands ---{Colors.ENDC}")
-    print(f"  Files are stored in: {Colors.BOLD}./{CLIENT_DIR}/{Colors.ENDC}")
-    print("  HELP, LIST, ECHO <msg>, TIME")
-    print("  UPLOAD <file>   - Upload file to server")
-    print("  DOWNLOAD <file> - Download file from server")
-    print("  CLOSE           - Disconnect and exit")
+    print("  HELP, LIST, ECHO <msg>, TIME, UPLOAD <file>, DOWNLOAD <file>, CLOSE")
     print("--------------------------\n")
 
 def drawProgressBar(current, total):
