@@ -22,7 +22,7 @@ def main():
     udpSock.bind((HOST, PORT))
     protocol.configureUdpBuffer(udpSock)
 
-    print(f"Threaded Server (Checksum Enabled) listening on {HOST}:{PORT}")
+    print(f"Threaded Server listening on {HOST}:{PORT}")
 
     while True:
         try:
@@ -32,7 +32,7 @@ def main():
             for sock in r:
                 if sock == tcpSock:
                     clientSock, addr = tcpSock.accept()
-                    print(f"Main Thread: Accepted connection from {addr}")
+                    print(f"Connected: {addr}")
                     t = threading.Thread(target=handleTcpClient, args=(clientSock, addr))
                     t.daemon = True
                     t.start()
@@ -48,16 +48,15 @@ def main():
     udpSock.close()
 
 def handleTcpClient(sock, addr):
-    print(f"Thread-{threading.get_ident()}: Started handler for {addr}")
     try:
         sock.setblocking(True)
         transport = protocol.TcpTransport(sock)
         handleSession(transport, False)
     except Exception as e:
-        print(f"Thread-{threading.get_ident()} Error: {e}")
+        print(f"Error {addr}: {e}")
     finally:
         sock.close()
-        print(f"Thread-{threading.get_ident()}: Closed connection {addr}")
+        print(f"Disconnected: {addr}")
 
 def handleSession(transport, isUdp):
     try:
@@ -83,7 +82,7 @@ def handleSession(transport, isUdp):
             elif cmd == 'UPLOAD':
                 handleUpload(transport, parts)
             else:
-                transport.sendMessage("UNKNOWN COMMAND")
+                transport.sendMessage("ERROR: Unknown command")
 
             if isUdp: break
 
@@ -91,7 +90,10 @@ def handleSession(transport, isUdp):
         pass
 
 def handleDownload(transport, args):
-    if len(args) < 2: return
+    if len(args) < 2:
+        transport.sendMessage("ERROR: Usage DOWNLOAD <filename>")
+        return
+
     filename = os.path.basename(args[1])
     filepath = os.path.join(STORAGE_DIR, filename)
 
@@ -102,8 +104,6 @@ def handleDownload(transport, args):
     fileSize = os.path.getsize(filepath)
     transport.sendMessage(f"SIZE {fileSize}")
 
-    # 1. Check for Resume Request
-    # Client sends: OFFSET <bytes> <checksum>
     try:
         response = transport.receiveLine()
         if not response.startswith("OFFSET"): return
@@ -112,25 +112,19 @@ def handleDownload(transport, args):
         offset = int(parts[1])
         clientChecksum = parts[2] if len(parts) > 2 else "0"
 
-        # 2. Verify Checksum logic
         if offset > 0:
-            print(f"Verifying resume for {filename}: Client has {offset} bytes...")
             serverChecksum = protocol.calculate_checksum(filepath, offset)
             if serverChecksum != clientChecksum:
-                print("Checksum mismatch! Forcing restart.")
-                transport.sendMessage("RESTART") # Command to overwrite
-
-                # Wait for client to acknowledge restart and ask for 0
+                transport.sendMessage("RESTART")
                 retry = transport.receiveLine()
                 if not retry.startswith("OFFSET 0"): return
                 offset = 0
             else:
-                transport.sendMessage("OK") # Checksum good, resume
+                transport.sendMessage("OK")
         else:
             transport.sendMessage("OK")
 
-        # 3. Send File
-        if fileSize == 0: return # Handle empty file
+        if fileSize == 0: return
 
         with open(filepath, 'rb') as f:
             f.seek(offset)
@@ -139,35 +133,38 @@ def handleDownload(transport, args):
                 if not chunk: break
                 transport.sendRawData(chunk)
 
-    except ValueError: pass
+    except (ValueError, IOError):
+        transport.sendMessage("ERROR: Internal server error")
 
 def handleUpload(transport, args):
-    if len(args) < 3: return
+    if len(args) < 3:
+        transport.sendMessage("ERROR: Usage UPLOAD <filename> <size>")
+        return
+
     filename = os.path.basename(args[1])
     filepath = os.path.join(STORAGE_DIR, filename)
-    totalSize = int(args[2])
+
+    try:
+        totalSize = int(args[2])
+    except ValueError:
+        transport.sendMessage("ERROR: Invalid size")
+        return
 
     currentSize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-    if currentSize > totalSize: currentSize = 0 # Local file bigger? Corrupt. Restart.
+    if currentSize > totalSize: currentSize = 0
 
-    # 1. Calculate Local Checksum
     localChecksum = protocol.calculate_checksum(filepath, currentSize)
-
-    # 2. Send OFFSET and CHECKSUM to Client
     transport.sendMessage(f"OFFSET {currentSize} {localChecksum}")
 
-    # 3. Wait for Client decision
-    # Client replies: "OK" (Resume) or "RESTART" (Mismatch)
     decision = transport.receiveLine()
 
     if decision == "RESTART":
         currentSize = 0
         if os.path.exists(filepath): os.remove(filepath)
-        transport.sendMessage("READY") # Tell client we are ready for fresh upload
+        transport.sendMessage("READY")
 
-    # 4. Receive Data
     if totalSize == 0:
-        open(filepath, 'wb').close() # Create empty file
+        open(filepath, 'wb').close()
         transport.sendMessage("UPLOAD COMPLETE")
         return
 
