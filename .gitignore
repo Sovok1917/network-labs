@@ -9,6 +9,7 @@ Thumbs.db
 
 # Lab specific storage
 server_files/
+client_files/
 client_downloads/
 *img
 

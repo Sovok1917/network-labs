@@ -12,11 +12,12 @@ except ImportError:
 
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 12345
-DOWNLOAD_DIR = "client_downloads"
-UPLOAD_DIR = "client_files" # Files to upload must be here
+CLIENT_DIR = "client_files" # Unified directory for both Uploads and Downloads
+DISK_CHUNK = 65536
 
 def printHelp():
     print("\n--- Available Commands ---")
+    print(f"  Files are stored in: ./{CLIENT_DIR}/")
     print("  HELP, LIST, ECHO <msg>, TIME, UPLOAD <file>, DOWNLOAD <file>, CLOSE")
     print("--------------------------\n")
 
@@ -31,7 +32,7 @@ def drawProgressBar(current, total):
     except:
         columns = 80
 
-    percent = current / total
+    percent = current / total if total > 0 else 1
     text_part = f" {percent:.1%} ({current}/{total} B)"
     bar_width = max(5, columns - len(text_part) - 3)
     filled = int(bar_width * percent)
@@ -41,8 +42,9 @@ def drawProgressBar(current, total):
     sys.stdout.flush()
 
 def main():
-    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
-    if not os.path.exists(UPLOAD_DIR): os.makedirs(UPLOAD_DIR)
+    # Create the unified directory if it doesn't exist
+    if not os.path.exists(CLIENT_DIR):
+        os.makedirs(CLIENT_DIR)
 
     isUdp = '--udp' in sys.argv
     args = [a for a in sys.argv[1:] if a != '--udp']
@@ -90,13 +92,14 @@ def processInput(transport, userIn):
 
 def performUpload(transport, parts):
     if len(parts) < 2:
-        print(f"Usage: UPLOAD <filename> (Must be in '{UPLOAD_DIR}/')")
+        print(f"Usage: UPLOAD <filename> (Must be in '{CLIENT_DIR}/')")
         return
 
     filename = parts[1]
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    filepath = os.path.join(CLIENT_DIR, filename)
+
     if not os.path.exists(filepath):
-        print(f"Error: File '{filename}' not found in '{UPLOAD_DIR}/'")
+        print(f"Error: File '{filename}' not found in '{CLIENT_DIR}/'")
         return
 
     totalSize = os.path.getsize(filepath)
@@ -117,13 +120,12 @@ def performUpload(transport, parts):
             print("Server has different file version. Overwriting...")
             transport.sendMessage("RESTART")
             offset = 0
-            # Wait for server ready
             if transport.receiveLine() != "READY": return
         else:
             transport.sendMessage("OK") # Matches
             print(f"Resuming upload from {offset}...")
     else:
-        transport.sendMessage("OK") # No offset to check
+        transport.sendMessage("OK")
 
     # 3. Send Data
     if totalSize == 0:
@@ -137,7 +139,7 @@ def performUpload(transport, parts):
     with open(filepath, 'rb') as f:
         f.seek(offset)
         while True:
-            chunk = f.read(protocol.DISK_CHUNK)
+            chunk = f.read(DISK_CHUNK)
             if not chunk: break
             transport.sendRawData(chunk)
             sentBytes += len(chunk)
@@ -148,10 +150,14 @@ def performUpload(transport, parts):
     print(f"Server: {transport.receiveLine()}")
 
 def performDownload(transport, parts):
-    if len(parts) < 2: return
-    localPath = os.path.join(DOWNLOAD_DIR, os.path.basename(parts[1]))
+    if len(parts) < 2:
+        print(f"Usage: DOWNLOAD <filename> (Will save to '{CLIENT_DIR}/')")
+        return
 
-    transport.sendMessage(f"DOWNLOAD {os.path.basename(parts[1])}")
+    filename = os.path.basename(parts[1])
+    localPath = os.path.join(CLIENT_DIR, filename)
+
+    transport.sendMessage(f"DOWNLOAD {filename}")
     response = transport.receiveLine()
     if response.startswith("ERROR"):
         print(f"Server: {response}")
@@ -193,7 +199,7 @@ def performDownload(transport, parts):
 
     with open(localPath, 'ab') as f:
         while remaining > 0:
-            data = transport.receiveRawData(min(protocol.DISK_CHUNK, remaining))
+            data = transport.receiveRawData(min(DISK_CHUNK, remaining))
             f.write(data)
             f.flush()
             remaining -= len(data)
