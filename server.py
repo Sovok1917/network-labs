@@ -8,7 +8,6 @@ import protocol
 HOST = '0.0.0.0'
 PORT = 12345
 STORAGE_DIR = "server_files"
-DISK_CHUNK = 65536
 
 def main():
     if not os.path.exists(STORAGE_DIR):
@@ -23,27 +22,22 @@ def main():
     udpSock.bind((HOST, PORT))
     protocol.configureUdpBuffer(udpSock)
 
-    print(f"Threaded Server (Variant 2) listening on {HOST}:{PORT}")
+    print(f"Threaded Server (Checksum Enabled) listening on {HOST}:{PORT}")
 
-    # Main Thread: Responsible ONLY for accepting connections
     while True:
         try:
-            # We use select to monitor both TCP (for new connections) and UDP
             inputs = [tcpSock, udpSock]
             r, _, _ = select.select(inputs, [], [])
 
             for sock in r:
                 if sock == tcpSock:
-                    # New TCP Client -> Spawn a Thread
                     clientSock, addr = tcpSock.accept()
                     print(f"Main Thread: Accepted connection from {addr}")
                     t = threading.Thread(target=handleTcpClient, args=(clientSock, addr))
-                    t.daemon = True # Ensures threads close if server exits
+                    t.daemon = True
                     t.start()
 
                 elif sock == udpSock:
-                    # UDP Packet -> Handle in Main Thread (or spawn thread if preferred)
-                    # Keeping it simple: UDP is stateless/fast, handle here.
                     transport = protocol.UdpTransport(udpSock)
                     handleSession(transport, True)
 
@@ -54,13 +48,8 @@ def main():
     udpSock.close()
 
 def handleTcpClient(sock, addr):
-    """
-    Dedicated Thread entry point for a TCP client.
-    Uses Blocking I/O for simple linear execution.
-    """
     print(f"Thread-{threading.get_ident()}: Started handler for {addr}")
     try:
-        # Revert to blocking mode for Threading simplicity
         sock.setblocking(True)
         transport = protocol.TcpTransport(sock)
         handleSession(transport, False)
@@ -71,10 +60,6 @@ def handleTcpClient(sock, addr):
         print(f"Thread-{threading.get_ident()}: Closed connection {addr}")
 
 def handleSession(transport, isUdp):
-    """
-    Shared session logic (Blocking style).
-    Used by both TCP Threads and UDP Main Loop.
-    """
     try:
         while True:
             commandLine = transport.receiveLine()
@@ -100,48 +85,99 @@ def handleSession(transport, isUdp):
             else:
                 transport.sendMessage("UNKNOWN COMMAND")
 
-            if isUdp: break # UDP is one-shot
+            if isUdp: break
 
     except (ConnectionResetError, BrokenPipeError):
-        pass # Normal disconnect
+        pass
 
 def handleDownload(transport, args):
     if len(args) < 2: return
-    filepath = os.path.join(STORAGE_DIR, os.path.basename(args[1]))
+    filename = os.path.basename(args[1])
+    filepath = os.path.join(STORAGE_DIR, filename)
+
     if not os.path.exists(filepath):
         transport.sendMessage("ERROR: File not found")
         return
 
-    transport.sendMessage(f"SIZE {os.path.getsize(filepath)}")
+    fileSize = os.path.getsize(filepath)
+    transport.sendMessage(f"SIZE {fileSize}")
+
+    # 1. Check for Resume Request
+    # Client sends: OFFSET <bytes> <checksum>
     try:
         response = transport.receiveLine()
         if not response.startswith("OFFSET"): return
 
-        offset = int(response.split(' ')[1])
+        parts = response.split(' ')
+        offset = int(parts[1])
+        clientChecksum = parts[2] if len(parts) > 2 else "0"
+
+        # 2. Verify Checksum logic
+        if offset > 0:
+            print(f"Verifying resume for {filename}: Client has {offset} bytes...")
+            serverChecksum = protocol.calculate_checksum(filepath, offset)
+            if serverChecksum != clientChecksum:
+                print("Checksum mismatch! Forcing restart.")
+                transport.sendMessage("RESTART") # Command to overwrite
+
+                # Wait for client to acknowledge restart and ask for 0
+                retry = transport.receiveLine()
+                if not retry.startswith("OFFSET 0"): return
+                offset = 0
+            else:
+                transport.sendMessage("OK") # Checksum good, resume
+        else:
+            transport.sendMessage("OK")
+
+        # 3. Send File
+        if fileSize == 0: return # Handle empty file
+
         with open(filepath, 'rb') as f:
             f.seek(offset)
             while True:
-                chunk = f.read(DISK_CHUNK)
+                chunk = f.read(protocol.DISK_CHUNK)
                 if not chunk: break
                 transport.sendRawData(chunk)
+
     except ValueError: pass
 
 def handleUpload(transport, args):
     if len(args) < 3: return
-    filepath = os.path.join(STORAGE_DIR, os.path.basename(args[1]))
+    filename = os.path.basename(args[1])
+    filepath = os.path.join(STORAGE_DIR, filename)
     totalSize = int(args[2])
 
     currentSize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-    if currentSize >= totalSize: currentSize = 0; os.remove(filepath)
+    if currentSize > totalSize: currentSize = 0 # Local file bigger? Corrupt. Restart.
 
-    transport.sendMessage(f"OFFSET {currentSize}")
+    # 1. Calculate Local Checksum
+    localChecksum = protocol.calculate_checksum(filepath, currentSize)
+
+    # 2. Send OFFSET and CHECKSUM to Client
+    transport.sendMessage(f"OFFSET {currentSize} {localChecksum}")
+
+    # 3. Wait for Client decision
+    # Client replies: "OK" (Resume) or "RESTART" (Mismatch)
+    decision = transport.receiveLine()
+
+    if decision == "RESTART":
+        currentSize = 0
+        if os.path.exists(filepath): os.remove(filepath)
+        transport.sendMessage("READY") # Tell client we are ready for fresh upload
+
+    # 4. Receive Data
+    if totalSize == 0:
+        open(filepath, 'wb').close() # Create empty file
+        transport.sendMessage("UPLOAD COMPLETE")
+        return
+
     remaining = totalSize - currentSize
     with open(filepath, 'ab') as f:
         while remaining > 0:
-            cSize = min(DISK_CHUNK, remaining)
+            cSize = min(protocol.DISK_CHUNK, remaining)
             data = transport.receiveRawData(cSize)
             f.write(data)
-            f.flush() # Ensure atomic write visibility
+            f.flush()
             remaining -= len(data)
 
     transport.sendMessage("UPLOAD COMPLETE")

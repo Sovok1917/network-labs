@@ -2,7 +2,7 @@ import socket
 import sys
 import os
 import time
-import shutil  # Added for terminal size detection
+import shutil
 import protocol
 
 try:
@@ -13,7 +13,7 @@ except ImportError:
 DEFAULT_IP = '127.0.0.1'
 DEFAULT_PORT = 12345
 DOWNLOAD_DIR = "client_downloads"
-DISK_CHUNK = 65536
+UPLOAD_DIR = "client_files" # Files to upload must be here
 
 def printHelp():
     print("\n--- Available Commands ---")
@@ -21,34 +21,28 @@ def printHelp():
     print("--------------------------\n")
 
 def drawProgressBar(current, total):
-    """
-    Draws a responsive progress bar that fits the terminal width.
-    """
+    if total == 0:
+        sys.stdout.write("\r[####################] 100% (Empty File)")
+        sys.stdout.flush()
+        return
+
     try:
-        # Get terminal width (default to 80 if fails)
         columns = shutil.get_terminal_size((80, 20)).columns
     except:
         columns = 80
 
-    # Calculate percentage
-    percent = current / total if total > 0 else 1
-
-    # Text part: " 100.0% (100MB/100MB)" - roughly 30 chars
+    percent = current / total
     text_part = f" {percent:.1%} ({current}/{total} B)"
-
-    # Calculate remaining space for the bar
-    # We subtract len(text_part) and 3 chars for brackets "[] "
     bar_width = max(5, columns - len(text_part) - 3)
-
     filled = int(bar_width * percent)
     bar = '#' * filled + '-' * (bar_width - filled)
 
-    # Output with carriage return, ensuring no overflow
     sys.stdout.write(f"\r[{bar}]{text_part}")
     sys.stdout.flush()
 
 def main():
     if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
+    if not os.path.exists(UPLOAD_DIR): os.makedirs(UPLOAD_DIR)
 
     isUdp = '--udp' in sys.argv
     args = [a for a in sys.argv[1:] if a != '--udp']
@@ -70,17 +64,12 @@ def main():
         printHelp()
 
         while True:
-            try:
-                userIn = input("client> ").strip()
-            except EOFError:
-                break
-
+            try: userIn = input("client> ").strip()
+            except EOFError: break
             if not userIn: continue
-
             if userIn.upper() == 'CLOSE':
                 transport.sendMessage("CLOSE")
                 break
-
             processInput(transport, userIn)
 
     except Exception as e: print(f"Error: {e}")
@@ -100,30 +89,61 @@ def processInput(transport, userIn):
         print(f"Server: {transport.receiveLine()}")
 
 def performUpload(transport, parts):
-    if len(parts) < 2 or not os.path.exists(parts[1]): return
+    if len(parts) < 2:
+        print(f"Usage: UPLOAD <filename> (Must be in '{UPLOAD_DIR}/')")
+        return
 
     filename = parts[1]
-    totalSize = os.path.getsize(filename)
-    transport.sendMessage(f"UPLOAD {os.path.basename(filename)} {totalSize}")
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    if not os.path.exists(filepath):
+        print(f"Error: File '{filename}' not found in '{UPLOAD_DIR}/'")
+        return
 
+    totalSize = os.path.getsize(filepath)
+    transport.sendMessage(f"UPLOAD {filename} {totalSize}")
+
+    # 1. Server replies with what it has: OFFSET <bytes> <checksum>
     response = transport.receiveLine()
     if not response.startswith("OFFSET"): return
 
-    offset = int(response.split(' ')[1])
-    print(f"Uploading... Resuming from {offset} / {totalSize} bytes")
+    parts = response.split(' ')
+    offset = int(parts[1])
+    serverChecksum = parts[2] if len(parts) > 2 else "0"
+
+    # 2. Verify Checksum
+    if offset > 0:
+        localChecksum = protocol.calculate_checksum(filepath, offset)
+        if localChecksum != serverChecksum:
+            print("Server has different file version. Overwriting...")
+            transport.sendMessage("RESTART")
+            offset = 0
+            # Wait for server ready
+            if transport.receiveLine() != "READY": return
+        else:
+            transport.sendMessage("OK") # Matches
+            print(f"Resuming upload from {offset}...")
+    else:
+        transport.sendMessage("OK") # No offset to check
+
+    # 3. Send Data
+    if totalSize == 0:
+        print("Uploading empty file...")
+        print(f"Server: {transport.receiveLine()}")
+        return
+
     startTime = time.time()
     sentBytes = offset
 
-    with open(filename, 'rb') as f:
+    with open(filepath, 'rb') as f:
         f.seek(offset)
         while True:
-            chunk = f.read(DISK_CHUNK)
+            chunk = f.read(protocol.DISK_CHUNK)
             if not chunk: break
             transport.sendRawData(chunk)
             sentBytes += len(chunk)
             drawProgressBar(sentBytes, totalSize)
 
-    print() # Newline to clear the bar
+    print()
     calculateBitrate(sentBytes - offset, startTime, time.time())
     print(f"Server: {transport.receiveLine()}")
 
@@ -133,31 +153,54 @@ def performDownload(transport, parts):
 
     transport.sendMessage(f"DOWNLOAD {os.path.basename(parts[1])}")
     response = transport.receiveLine()
-    if response.startswith("ERROR"): return
+    if response.startswith("ERROR"):
+        print(f"Server: {response}")
+        return
 
     totalSize = int(response.split(' ')[1])
+
+    # 1. Calculate Local Offset and Checksum
     currentSize = os.path.getsize(localPath) if os.path.exists(localPath) else 0
+    if currentSize > totalSize: currentSize = 0
 
-    if currentSize >= totalSize:
+    localChecksum = protocol.calculate_checksum(localPath, currentSize)
+
+    # 2. Send OFFSET request to Server
+    transport.sendMessage(f"OFFSET {currentSize} {localChecksum}")
+
+    # 3. Wait for Server Decision
+    decision = transport.receiveLine()
+    if decision == "RESTART":
+        print("Remote file changed. Restarting download...")
+        if os.path.exists(localPath): os.remove(localPath)
+        transport.sendMessage("OFFSET 0 0") # Request from start
         currentSize = 0
-        os.remove(localPath)
+    elif decision != "OK":
+        return
 
-    transport.sendMessage(f"OFFSET {currentSize}")
-    print(f"Downloading... Resuming from {currentSize} / {totalSize} bytes")
+    if currentSize > 0:
+        print(f"Resuming download from {currentSize}...")
+
+    # 4. Receive Data
+    if totalSize == 0:
+        open(localPath, 'wb').close()
+        print("Downloaded empty file.")
+        return
+
     startTime = time.time()
     receivedBytes = 0
     remaining = totalSize - currentSize
 
     with open(localPath, 'ab') as f:
         while remaining > 0:
-            data = transport.receiveRawData(min(DISK_CHUNK, remaining))
+            data = transport.receiveRawData(min(protocol.DISK_CHUNK, remaining))
             f.write(data)
             f.flush()
             remaining -= len(data)
             receivedBytes += len(data)
             drawProgressBar(totalSize - remaining, totalSize)
 
-    print() # Newline to clear the bar
+    print()
     calculateBitrate(receivedBytes, startTime, time.time())
 
 def calculateBitrate(bytesTransferred, start, end):

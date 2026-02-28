@@ -1,9 +1,11 @@
 import socket
 import os
+import hashlib
 import udpProtocol
 
 # Centralized Protocol Constants
-CHUNK_SIZE = 1024 * 1024 * 10 # 10MB chunks
+CHUNK_SIZE = 1024 * 1024 * 10 # 10MB chunks (for UDP logic)
+DISK_CHUNK = 65536           # 64KB chunks (for Disk I/O)
 
 def configureKeepAlive(sock):
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -20,6 +22,27 @@ def configureUdpBuffer(sock):
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
     except socket.error:
         pass
+
+def calculate_checksum(filepath, length):
+    """
+    Calculates MD5 checksum of the first 'length' bytes of a file.
+    Used to verify if a partial file matches the source.
+    """
+    if length == 0: return "0"
+    if not os.path.exists(filepath): return "0"
+
+    hasher = hashlib.md5()
+    remaining = length
+    try:
+        with open(filepath, 'rb') as f:
+            while remaining > 0:
+                chunk = f.read(min(DISK_CHUNK, remaining))
+                if not chunk: break
+                hasher.update(chunk)
+                remaining -= len(chunk)
+    except IOError:
+        return "0"
+    return hasher.hexdigest()
 
 class TcpTransport:
     def __init__(self, sock):
